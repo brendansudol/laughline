@@ -80,69 +80,82 @@ class DownloadedItem:
     info_json_path: Path
 
 
+def _extract_video_ids(info: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    if info.get("_type") == "playlist":
+        for e in info.get("entries") or []:
+            if e and e.get("id"):
+                ids.append(e["id"])
+    elif info.get("id"):
+        ids.append(info["id"])
+    return ids
+
+
 def download_youtube_audio(
     url: str, out_dir: Path, mode: str = "auto"
 ) -> List[DownloadedItem]:
     """
     Downloads best audio, extracts to mp3, and writes info JSON.
     Supports single video URLs and playlist URLs.
+    Skips videos that already have an mp3 on disk.
     """
     ensure_dir(out_dir)
 
     from yt_dlp import YoutubeDL
 
     effective_mode = choose_mode(url, mode)
-
-    ydl_opts: Dict[str, Any] = {
-        "format": "bestaudio/best",
-        "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
-        "writeinfojson": True,
-        "writethumbnail": False,
+    base_opts: Dict[str, Any] = {
         "ignoreerrors": True,
         "quiet": False,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            }
-        ],
         "noplaylist": (effective_mode == "video"),
     }
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    # First pass: resolve video IDs without downloading
+    with YoutubeDL(base_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
     if not info:
         return []
 
-    ids: List[str] = []
-    if isinstance(info, dict) and info.get("_type") == "playlist":
-        entries = info.get("entries") or []
-        for e in entries:
-            if not e:
-                continue
-            vid = e.get("id")
-            if vid:
-                ids.append(vid)
+    ids = _extract_video_ids(info)
+    if not ids:
+        return []
+
+    # Figure out which videos still need downloading
+    need_download = [
+        vid for vid in ids if not (out_dir / f"{vid}.mp3").exists()
+    ]
+
+    if need_download:
+        print(f"[download] {len(need_download)} of {len(ids)} videos need downloading")
+        download_opts: Dict[str, Any] = {
+            **base_opts,
+            "format": "bestaudio/best",
+            "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
+            "writeinfojson": True,
+            "writethumbnail": False,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "0",
+                }
+            ],
+        }
+
+        with YoutubeDL(download_opts) as ydl:
+            for vid in need_download:
+                ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={vid}", download=True
+                )
     else:
-        vid = info.get("id") if isinstance(info, dict) else None
-        if vid:
-            ids.append(vid)
+        print(f"[download] all {len(ids)} videos already cached, skipping")
 
     results: List[DownloadedItem] = []
     for vid in ids:
         audio_path = out_dir / f"{vid}.mp3"
         info_path = out_dir / f"{vid}.info.json"
-        if audio_path.exists() and info_path.exists():
-            results.append(
-                DownloadedItem(
-                    video_id=vid,
-                    audio_path=audio_path,
-                    info_json_path=info_path,
-                )
-            )
-        elif audio_path.exists():
+        if audio_path.exists():
             results.append(
                 DownloadedItem(
                     video_id=vid,
