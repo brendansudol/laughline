@@ -348,6 +348,9 @@ Tasks:
 
 2) Extract the jokes from ONLY the monologue portion.
    - Each joke must be returned as quote: an EXACT contiguous substring copied VERBATIM from the transcript.
+   - Each quote must include the FULL joke: both the setup (the premise or news item being discussed)
+     AND the punchline (the comedic payoff). Do NOT extract only the punchline.
+     The quote should begin where the joke's topic is first introduced and end after the punchline lands.
    - Do NOT paraphrase, do NOT add words, do NOT change punctuation, do NOT use ellipses (...).
    - If you cannot copy a joke as a single contiguous exact quote, SKIP it.
    - Avoid duplicates; keep jokes in the order they appear.
