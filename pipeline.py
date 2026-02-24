@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -68,6 +69,13 @@ def concat_tokens(tokens: List[Dict[str, Any]]) -> str:
     if has_spacing:
         return "".join(t.get("text", "") for t in tokens).strip()
     return " ".join(t.get("text", "") for t in tokens).strip()
+
+
+def normalize_whitespace(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 # -----------------------------
@@ -294,122 +302,123 @@ def normalize_transcript(provider: str, raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Joke candidate extraction
+# LLM-based joke extraction
 # -----------------------------
-def joke_candidates_from_laughter(
-    canonical: Dict[str, Any],
-    lookback_seconds: float = 25.0,
-    min_word_tokens: int = 8,
-) -> List[Dict[str, Any]]:
-    """
-    Basic heuristic:
-      - for every laughter/applause event, take the preceding N seconds
-        of spoken text as a "joke candidate".
-    """
-    words = canonical.get("words") or []
-    events = canonical.get("events") or []
+LLM_EXTRACTION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "monologue_end": {
+            "type": "object",
+            "properties": {
+                "ended": {"type": "boolean"},
+                "end_marker_quote": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["ended", "end_marker_quote", "reason"],
+            "additionalProperties": False,
+        },
+        "jokes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "quote": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["quote", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["monologue_end", "jokes"],
+    "additionalProperties": False,
+}
 
-    laugh_events = [
-        e
-        for e in events
-        if e.get("event_type") in ("laughter", "applause", "cheering")
-    ]
-    laugh_events.sort(key=lambda e: e.get("start", 0))
+LLM_EXTRACTION_INSTRUCTIONS = """You are extracting jokes from a TV show's MONOLOGUE section.
 
-    candidates: List[Dict[str, Any]] = []
-    for ev in laugh_events:
-        end_t = float(ev.get("start", 0) or 0)
-        start_t = max(0.0, end_t - lookback_seconds)
+You will be given the full transcript text as input. The transcript may include content after the monologue (e.g., interview, desk pieces, segments, commercials).
 
-        window_tokens = [
-            w
-            for w in words
-            if (w.get("start", 0) or 0) >= start_t
-            and (w.get("end", 0) or 0) <= end_t
-            and w.get("type") in ("word", "spacing")
-        ]
+Tasks:
+1) Determine if/where the monologue ends.
+   - If the monologue ends, set monologue_end.ended=true and provide monologue_end.end_marker_quote:
+     a short contiguous snippet copied VERBATIM from the transcript that clearly signals the monologue has ended
+     (e.g., "We'll be right back", "Coming up...", "Our first guest...", "After the break...", "Please welcome...").
+   - If you do NOT see a clear transition, set ended=false and end_marker_quote="".
+   - reason: brief explanation (do not quote large text).
 
-        word_count = sum(1 for t in window_tokens if t.get("type") == "word")
-        if word_count < min_word_tokens:
-            continue
+2) Extract the jokes from ONLY the monologue portion.
+   - Each joke must be returned as quote: an EXACT contiguous substring copied VERBATIM from the transcript.
+   - Do NOT paraphrase, do NOT add words, do NOT change punctuation, do NOT use ellipses (...).
+   - If you cannot copy a joke as a single contiguous exact quote, SKIP it.
+   - Avoid duplicates; keep jokes in the order they appear.
 
-        candidates.append(
-            {
-                "start": start_t,
-                "end": end_t,
-                "trigger_event": ev,
-                "text": concat_tokens(window_tokens),
-                "word_count": word_count,
+Output must match the provided JSON schema exactly.
+"""
+
+
+def extract_jokes_with_llm(
+    transcript_text: str, model: str = "gpt-4.1-mini"
+) -> Dict[str, Any]:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+    text = normalize_whitespace(transcript_text)
+
+    resp = client.responses.create(
+        model=model,
+        instructions=LLM_EXTRACTION_INSTRUCTIONS,
+        input=text,
+        temperature=0,
+        store=False,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "monologue_joke_extraction",
+                "schema": LLM_EXTRACTION_SCHEMA,
+                "strict": True,
             }
-        )
+        },
+    )
 
-    return candidates
+    data = json.loads(resp.output_text)
 
+    # Enforce monologue cutoff in code
+    monologue_text = text
+    end_quote = data["monologue_end"]["end_marker_quote"].strip()
+    if data["monologue_end"]["ended"] and end_quote:
+        idx = text.find(end_quote)
+        if idx != -1:
+            monologue_text = text[:idx]
 
-def segment_by_silence(
-    canonical: Dict[str, Any],
-    gap_seconds: float = 1.2,
-    max_segment_seconds: float = 45.0,
-) -> List[Dict[str, Any]]:
-    """
-    Fallback when you don't have reliable laughter tags:
-    - split on long timing gaps between words
-    - also split if a segment grows beyond max_segment_seconds
-    """
-    words = [
-        w
-        for w in (canonical.get("words") or [])
-        if w.get("type") in ("word", "spacing")
-    ]
-    if not words:
-        return []
+    # Validate verbatim quotes
+    valid: List[Dict[str, Any]] = []
+    invalid: List[Dict[str, Any]] = []
 
-    word_tokens = [w for w in words if w.get("type") == "word"]
-    if not word_tokens:
-        return []
+    for j in data["jokes"]:
+        q = j["quote"]
+        if q and (q in monologue_text):
+            valid.append(j)
+        else:
+            invalid.append(j)
 
-    segments: List[Dict[str, Any]] = []
-    seg_start = word_tokens[0]["start"]
-    seg_tokens: List[Dict[str, Any]] = []
+    # Dedupe exact duplicates while preserving order
+    seen: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for j in valid:
+        if j["quote"] not in seen:
+            seen.add(j["quote"])
+            deduped.append(j)
 
-    def flush(end_time: float):
-        nonlocal seg_start, seg_tokens
-        if seg_tokens:
-            segments.append(
-                {
-                    "start": float(seg_start),
-                    "end": float(end_time),
-                    "text": concat_tokens(seg_tokens),
-                }
-            )
-        seg_tokens = []
+    data["jokes"] = deduped
+    data["validation"] = {
+        "invalid_quote_count": len(invalid),
+        "invalid_quotes": invalid[:5],
+        "used_cutoff": bool(data["monologue_end"]["ended"] and end_quote),
+    }
+    data["model"] = model
 
-    last_word_end = word_tokens[0]["end"]
-    current_max_end = last_word_end
-
-    idx_word = 0
-    for tok in words:
-        seg_tokens.append(tok)
-        current_max_end = max(
-            current_max_end, tok.get("end", current_max_end) or current_max_end
-        )
-
-        if tok.get("type") == "word":
-            next_word = (
-                word_tokens[idx_word + 1]
-                if idx_word + 1 < len(word_tokens)
-                else None
-            )
-            if next_word:
-                gap = float(next_word["start"]) - float(tok["end"])
-                seg_len = float(tok["end"]) - float(seg_start)
-                if gap >= gap_seconds or seg_len >= max_segment_seconds:
-                    flush(tok["end"])
-                    seg_start = next_word["start"]
-            idx_word += 1
-
-    flush(current_max_end)
-    return segments
+    return data
 
 
 # -----------------------------
@@ -420,7 +429,11 @@ def run_pipeline(
     out_dir: Path,
     mode: str,
     providers: Sequence[str],
+    llm_model: str = "gpt-4.1-mini",
 ) -> None:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Missing OPENAI_API_KEY in environment/.env")
+
     ensure_dir(out_dir)
     media_dir = out_dir / "media"
     transcripts_dir = out_dir / "transcripts"
@@ -443,7 +456,7 @@ def run_pipeline(
             canonical_path = (
                 transcripts_dir / provider / "canonical" / f"{vid}.json"
             )
-            jokes_path = jokes_dir / provider / f"{vid}.candidates.json"
+            llm_path = jokes_dir / provider / f"{vid}.llm.json"
 
             # 1) Transcribe (cached)
             if raw_path.exists():
@@ -462,14 +475,17 @@ def run_pipeline(
             canonical = normalize_transcript(provider, raw)
             write_json(canonical_path, canonical)
 
-            # 3) Joke candidates
-            candidates = joke_candidates_from_laughter(canonical)
-            if not candidates:
-                candidates = segment_by_silence(canonical)
+            # 3) LLM joke extraction (cached)
+            if llm_path.exists():
+                print(f"[skip:{provider}] {vid} -> {llm_path.name} already exists")
+                continue
 
-            write_json(jokes_path, candidates)
+            print(f"[extract:{provider}] {vid} (model={llm_model})")
+            result = extract_jokes_with_llm(canonical["text"], model=llm_model)
+
+            write_json(llm_path, result)
             print(
-                f"[ok:{provider}] {vid} -> {len(candidates)} candidate segments"
+                f"[ok:{provider}] {vid} -> {len(result['jokes'])} jokes extracted"
             )
 
 
@@ -494,6 +510,11 @@ def main():
         default="elevenlabs",
         help="Comma-separated: elevenlabs,assemblyai,both (default: elevenlabs)",
     )
+    parser.add_argument(
+        "--llm-model",
+        default="gpt-4.1-mini",
+        help="OpenAI model for joke extraction (default: gpt-4.1-mini)",
+    )
 
     args = parser.parse_args()
 
@@ -504,7 +525,13 @@ def main():
     else:
         providers = [p.strip() for p in providers_arg.split(",") if p.strip()]
 
-    run_pipeline(args.url, out_dir=out_dir, mode=args.mode, providers=providers)
+    run_pipeline(
+        args.url,
+        out_dir=out_dir,
+        mode=args.mode,
+        providers=providers,
+        llm_model=args.llm_model,
+    )
 
 
 if __name__ == "__main__":
