@@ -3,11 +3,21 @@ import argparse
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
+
+
+# -----------------------------
+# Logging
+# -----------------------------
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 # -----------------------------
@@ -137,7 +147,7 @@ def download_youtube_audio(
     ]
 
     if need_download:
-        print(f"[download] {len(need_download)} of {len(ids)} videos need downloading")
+        log(f"[download] {len(need_download)} of {len(ids)} videos need downloading")
         download_opts: Dict[str, Any] = {
             **base_opts,
             "format": "bestaudio/best",
@@ -159,7 +169,7 @@ def download_youtube_audio(
                     f"https://www.youtube.com/watch?v={vid}", download=True
                 )
     else:
-        print(f"[download] all {len(ids)} videos already cached, skipping")
+        log(f"[download] all {len(ids)} videos already cached, skipping")
 
     results: List[DownloadedItem] = []
     for vid in ids:
@@ -437,8 +447,9 @@ def run_pipeline(
     providers: Sequence[str],
     llm_model: str = "gpt-4.1-mini",
     limit: Optional[int] = None,
+    download_only: bool = False,
 ) -> None:
-    if not os.getenv("OPENAI_API_KEY"):
+    if not download_only and not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY in environment/.env")
 
     ensure_dir(out_dir)
@@ -448,13 +459,19 @@ def run_pipeline(
 
     items = download_youtube_audio(url, media_dir, mode=mode, limit=limit)
     if not items:
-        print("No downloadable items found.")
+        log("No downloadable items found.")
         return
 
-    for item in items:
+    if download_only:
+        log(f"[download-only] {len(items)} video(s) ready in {media_dir}")
+        return
+
+    total = len(items)
+    for idx, item in enumerate(items, 1):
+        prefix = f"[{idx}/{total}]"
         vid = item.video_id
         if not item.audio_path.exists():
-            print(f"[skip] missing audio: {item.audio_path}")
+            log(f"{prefix} [skip] missing audio: {item.audio_path}")
             continue
 
         for provider in providers:
@@ -469,13 +486,16 @@ def run_pipeline(
             if raw_path.exists():
                 raw = read_json(raw_path)
             else:
-                print(f"[transcribe:{provider}] {vid}")
+                log(f"{prefix} [transcribe:{provider}] {vid}")
+                t0 = time.monotonic()
                 if provider == "assemblyai":
                     raw = transcribe_with_assemblyai(item.audio_path)
                 elif provider == "elevenlabs":
                     raw = transcribe_with_elevenlabs(item.audio_path)
                 else:
                     raise ValueError(f"Unknown provider: {provider}")
+                elapsed = time.monotonic() - t0
+                log(f"{prefix} [transcribe:{provider}] {vid} done ({elapsed:.1f}s)")
                 write_json(raw_path, raw)
 
             # 2) Normalize
@@ -484,15 +504,17 @@ def run_pipeline(
 
             # 3) LLM joke extraction (cached)
             if llm_path.exists():
-                print(f"[skip:{provider}] {vid} -> {llm_path.name} already exists")
+                log(f"{prefix} [skip:{provider}] {vid} -> {llm_path.name} already exists")
                 continue
 
-            print(f"[extract:{provider}] {vid} (model={llm_model})")
+            log(f"{prefix} [extract:{provider}] {vid} (model={llm_model})")
+            t0 = time.monotonic()
             result = extract_jokes_with_llm(canonical["text"], model=llm_model)
+            elapsed = time.monotonic() - t0
 
             write_json(llm_path, result)
-            print(
-                f"[ok:{provider}] {vid} -> {len(result['jokes'])} jokes extracted"
+            log(
+                f"{prefix} [ok:{provider}] {vid} -> {len(result['jokes'])} jokes extracted ({elapsed:.1f}s)"
             )
 
 
@@ -528,6 +550,11 @@ def main():
         default=None,
         help="Max number of videos to process (useful for large playlists)",
     )
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Only download audio; skip transcription and joke extraction",
+    )
 
     args = parser.parse_args()
 
@@ -545,6 +572,7 @@ def main():
         providers=providers,
         llm_model=args.llm_model,
         limit=args.limit,
+        download_only=args.download_only,
     )
 
 
