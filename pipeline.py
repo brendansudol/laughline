@@ -189,6 +189,7 @@ def transcribe_with_assemblyai(audio_path: Path) -> Dict[str, Any]:
     transcriber = aai.Transcriber()
 
     config = aai.TranscriptionConfig(
+        speech_models=["universal-3-pro", "universal-2"],
         punctuate=True,
         format_text=True,
         disfluencies=True,
