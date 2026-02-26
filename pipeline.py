@@ -31,7 +31,7 @@ def to_jsonable(obj: Any) -> Any:
 
 def looks_like_playlist(url: str) -> bool:
     u = url.strip()
-    return ("/playlist" in u) or ("playlist?list=" in u)
+    return ("/playlist" in u) or ("list=" in u)
 
 
 def choose_mode(url: str, mode: str) -> str:
@@ -100,7 +100,7 @@ def _extract_video_ids(info: Dict[str, Any]) -> List[str]:
 
 
 def download_youtube_audio(
-    url: str, out_dir: Path, mode: str = "auto"
+    url: str, out_dir: Path, mode: str = "auto", limit: Optional[int] = None
 ) -> List[DownloadedItem]:
     """
     Downloads best audio, extracts to mp3, and writes info JSON.
@@ -117,6 +117,8 @@ def download_youtube_audio(
         "quiet": False,
         "noplaylist": (effective_mode == "video"),
     }
+    if limit is not None and effective_mode == "playlist":
+        base_opts["playlistend"] = limit
 
     # First pass: resolve video IDs without downloading
     with YoutubeDL(base_opts) as ydl:
@@ -434,6 +436,7 @@ def run_pipeline(
     mode: str,
     providers: Sequence[str],
     llm_model: str = "gpt-4.1-mini",
+    limit: Optional[int] = None,
 ) -> None:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY in environment/.env")
@@ -443,7 +446,7 @@ def run_pipeline(
     transcripts_dir = out_dir / "transcripts"
     jokes_dir = out_dir / "jokes"
 
-    items = download_youtube_audio(url, media_dir, mode=mode)
+    items = download_youtube_audio(url, media_dir, mode=mode, limit=limit)
     if not items:
         print("No downloadable items found.")
         return
@@ -519,6 +522,12 @@ def main():
         default="gpt-4.1-mini",
         help="OpenAI model for joke extraction (default: gpt-4.1-mini)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max number of videos to process (useful for large playlists)",
+    )
 
     args = parser.parse_args()
 
@@ -535,6 +544,7 @@ def main():
         mode=args.mode,
         providers=providers,
         llm_model=args.llm_model,
+        limit=args.limit,
     )
 
 
