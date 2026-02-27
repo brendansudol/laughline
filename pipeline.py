@@ -447,9 +447,12 @@ def run_pipeline(
     providers: Sequence[str],
     llm_model: str = "gpt-4.1-mini",
     limit: Optional[int] = None,
-    download_only: bool = False,
+    stop_after: Optional[str] = None,
 ) -> None:
-    if not download_only and not os.getenv("OPENAI_API_KEY"):
+    if stop_after not in (None, "download", "transcribe"):
+        raise ValueError(f"Invalid stop_after value: {stop_after}")
+
+    if stop_after is None and not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY in environment/.env")
 
     ensure_dir(out_dir)
@@ -462,8 +465,8 @@ def run_pipeline(
         log("No downloadable items found.")
         return
 
-    if download_only:
-        log(f"[download-only] {len(items)} video(s) ready in {media_dir}")
+    if stop_after == "download":
+        log(f"[stop-after:download] {len(items)} video(s) ready in {media_dir}")
         return
 
     total = len(items)
@@ -501,6 +504,9 @@ def run_pipeline(
             # 2) Normalize
             canonical = normalize_transcript(provider, raw)
             write_json(canonical_path, canonical)
+
+            if stop_after == "transcribe":
+                continue
 
             # 3) LLM joke extraction (cached)
             if llm_path.exists():
@@ -551,9 +557,10 @@ def main():
         help="Max number of videos to process (useful for large playlists)",
     )
     parser.add_argument(
-        "--download-only",
-        action="store_true",
-        help="Only download audio; skip transcription and joke extraction",
+        "--stop-after",
+        choices=["download", "transcribe"],
+        default=None,
+        help="Stop pipeline after this stage (download or transcribe)",
     )
 
     args = parser.parse_args()
@@ -572,7 +579,7 @@ def main():
         providers=providers,
         llm_model=args.llm_model,
         limit=args.limit,
-        download_only=args.download_only,
+        stop_after=args.stop_after,
     )
 
 
