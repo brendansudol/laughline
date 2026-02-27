@@ -364,6 +364,11 @@ Tasks:
    - Each quote must include the FULL joke: both the setup (the premise or news item being discussed)
      AND the punchline (the comedic payoff). Do NOT extract only the punchline.
      The quote should begin where the joke's topic is first introduced and end after the punchline lands.
+   - ONE joke per quote. Each quote should cover a single news item or comedic beat.
+     When the topic changes (e.g., new subject, "And finally", a different news story), start a new quote.
+     Do NOT bundle multiple unrelated jokes into one quote.
+   - The transcript may contain noise such as [laughing], [applause], stutters, false starts, or cutoffs.
+     Copy them EXACTLY as they appear. Never clean up, remove, or smooth over transcript artifacts.
    - Do NOT paraphrase, do NOT add words, do NOT change punctuation, do NOT use ellipses (...).
    - If you cannot copy a joke as a single contiguous exact quote, SKIP it.
    - Avoid duplicates; keep jokes in the order they appear.
@@ -445,7 +450,7 @@ def run_pipeline(
     out_dir: Path,
     mode: str,
     providers: Sequence[str],
-    llm_model: str = "gpt-4.1-mini",
+    llm_model: str = "gpt-5.2",
     limit: Optional[int] = None,
     stop_after: Optional[str] = None,
 ) -> None:
@@ -547,8 +552,8 @@ def main():
     )
     parser.add_argument(
         "--llm-model",
-        default="gpt-4.1-mini",
-        help="OpenAI model for joke extraction (default: gpt-4.1-mini)",
+        default="gpt-5.2",
+        help="OpenAI model for joke extraction (default: gpt-5.2)",
     )
     parser.add_argument(
         "--limit",
