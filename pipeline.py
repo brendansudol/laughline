@@ -377,8 +377,55 @@ Output must match the provided JSON schema exactly.
 """
 
 
+CONTENT_FILTER_FALLBACK_MODEL = "gpt-4.1-mini"
+
+
+def _call_extraction_api(
+    client: Any, model: str, text: str
+) -> Dict[str, Any]:
+    """Call the OpenAI API and return parsed JSON. Retries on transient parse errors."""
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        resp = client.responses.create(
+            model=model,
+            instructions=LLM_EXTRACTION_INSTRUCTIONS,
+            input=text,
+            temperature=0,
+            store=False,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "monologue_joke_extraction",
+                    "schema": LLM_EXTRACTION_SCHEMA,
+                    "strict": True,
+                }
+            },
+        )
+
+        # Check for content filter before parsing
+        if resp.status == "incomplete":
+            reason = getattr(resp.incomplete_details, "reason", None)
+            if reason == "content_filter":
+                raise ContentFilterError(model)
+
+        try:
+            return json.loads(resp.output_text)
+        except json.JSONDecodeError:
+            if attempt < max_retries:
+                log(f"[extract] JSON parse error, retrying ({attempt}/{max_retries})")
+                time.sleep(2)
+            else:
+                raise
+
+
+class ContentFilterError(Exception):
+    def __init__(self, model: str):
+        self.model = model
+        super().__init__(f"Content filter triggered on model {model}")
+
+
 def extract_jokes_with_llm(
-    transcript_text: str, model: str = "gpt-4.1-mini"
+    transcript_text: str, model: str = "gpt-5.2"
 ) -> Dict[str, Any]:
     from openai import OpenAI
 
@@ -386,23 +433,14 @@ def extract_jokes_with_llm(
 
     text = normalize_whitespace(transcript_text)
 
-    resp = client.responses.create(
-        model=model,
-        instructions=LLM_EXTRACTION_INSTRUCTIONS,
-        input=text,
-        temperature=0,
-        store=False,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "monologue_joke_extraction",
-                "schema": LLM_EXTRACTION_SCHEMA,
-                "strict": True,
-            }
-        },
-    )
-
-    data = json.loads(resp.output_text)
+    used_model = model
+    try:
+        data = _call_extraction_api(client, model, text)
+    except ContentFilterError:
+        fallback = CONTENT_FILTER_FALLBACK_MODEL
+        log(f"[extract] content filter hit on {model}, falling back to {fallback}")
+        data = _call_extraction_api(client, fallback, text)
+        used_model = fallback
 
     # Enforce monologue cutoff in code
     monologue_text = text
@@ -437,7 +475,7 @@ def extract_jokes_with_llm(
         "invalid_quotes": invalid[:5],
         "used_cutoff": bool(data["monologue_end"]["ended"] and end_quote),
     }
-    data["model"] = model
+    data["model"] = used_model
 
     return data
 
@@ -519,14 +557,17 @@ def run_pipeline(
                 continue
 
             log(f"{prefix} [extract:{provider}] {vid} (model={llm_model})")
-            t0 = time.monotonic()
-            result = extract_jokes_with_llm(canonical["text"], model=llm_model)
-            elapsed = time.monotonic() - t0
+            try:
+                t0 = time.monotonic()
+                result = extract_jokes_with_llm(canonical["text"], model=llm_model)
+                elapsed = time.monotonic() - t0
 
-            write_json(llm_path, result)
-            log(
-                f"{prefix} [ok:{provider}] {vid} -> {len(result['jokes'])} jokes extracted ({elapsed:.1f}s)"
-            )
+                write_json(llm_path, result)
+                log(
+                    f"{prefix} [ok:{provider}] {vid} -> {len(result['jokes'])} jokes extracted ({elapsed:.1f}s)"
+                )
+            except Exception as e:
+                log(f"{prefix} [error:{provider}] {vid} -> {e}")
 
 
 def main():
